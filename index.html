@@ -335,40 +335,58 @@
 
     <!--
       REGISTER-INTEREST FORM SETUP
-      Paste your endpoint URL into FORM_ENDPOINT below to capture emails.
-      Easiest option (matches the app's feedback flow) — a Google Apps Script Web App
-      that appends to a Google Sheet:
 
-        function doPost(e) {
-          const sheet = SpreadsheetApp.openById('YOUR_SHEET_ID').getSheetByName('Waitlist');
-          sheet.appendRow([new Date(), e.parameter.email, e.parameter.source || '']);
-          return ContentService.createTextOutput('ok');
-        }
+      One step: paste your Apps Script /exec URL into WAITLIST_ENDPOINT below.
 
-      Deploy → New deployment → Web app → Execute as "Me", Access "Anyone" → copy the URL.
-      (Leaving FORM_ENDPOINT empty still shows the success state, but won't store anything.)
+      The server side is NOT inline here — it lives in scripts/waitlist-apps-script.gs
+      in the daywise repo (it validates and length-caps the email, stamps the time
+      server-side, neutralises spreadsheet formula injection and ignores duplicates).
+      Paste that file into the Sheet's Apps Script editor, then:
+
+        Deploy → New deployment → Web app → Execute as "Me", Who has access "Anyone"
+
+      and copy the /exec URL it gives you. Full steps are in the .gs file's header.
+
+      While WAITLIST_ENDPOINT is empty the form reports an error rather than pretending
+      to work — a false "You're on the list!" is the one outcome worse than an error.
+
+      NOTE: this page is deployed from the separate lachlan-odea/daywise-coming-soon
+      repo. Editing it here changes nothing live until it is copied across.
     -->
     <script>
       /* Waitlist capture.
        *
-       * Writes straight to Firestore over its REST API, so this page stays a single
-       * self-contained file with no SDK. Both values below are Firebase's public web
-       * identifiers — the same pair already shipped in the main app's JS bundle. They
-       * are NOT secrets: access is controlled by the /waitlist rules in
-       * firestore.rules, which allow create-only and no public read.
+       * Posts to a Google Apps Script web app, which appends the signup to a Sheet.
+       * See scripts/waitlist-apps-script.gs in the daywise repo for the server side
+       * and its deployment steps.
        *
-       * Deliberately not mode:'no-cors' (as the previous Apps Script version was).
-       * Firestore sends CORS headers, so the response is readable and a rejected
-       * write can actually be reported instead of silently showing success.
+       * Not Firestore: App Check is enforced for Cloud Firestore, so an anonymous
+       * static page cannot write to it — such requests are rejected before security
+       * rules are consulted. Posting here keeps this page a single dependency-free
+       * file and leaves App Check protecting real user data.
+       *
+       * Sent as text/plain so the browser treats it as a "simple" request and skips
+       * the CORS preflight, which Apps Script cannot answer.
+       *
+       * TWO-STEP DELIVERY. The response is read where possible, so a server-side
+       * rejection is reported rather than silently celebrated. But Apps Script does
+       * not reliably send CORS headers on its response (which is why the in-app
+       * feedback flow posts with mode:'no-cors' and never reads a reply), and a
+       * blocked *read* is not a failed *write* — the row still lands. So a fetch that
+       * rejects before any response can be inspected is re-sent blind with
+       * mode:'no-cors' and treated as delivered. The .gs ignores duplicates, so the
+       * resend cannot double up a signup that already got through.
+       *
+       * The distinction matters: anything we could actually read — including an HTTP
+       * error or a non-JSON body — is taken as the final answer and never retried
+       * blind, because there CORS was demonstrably not the problem.
        */
-      var FIREBASE_PROJECT_ID = 'daybook-f5bab';
-      var FIREBASE_API_KEY = 'AIzaSyAjkdSBV71wMYOVidQCrtE1L4H6x877QFc';
-
-      var WAITLIST_URL =
-        'https://firestore.googleapis.com/v1/projects/' +
-        FIREBASE_PROJECT_ID +
-        '/databases/(default)/documents/waitlist?key=' +
-        FIREBASE_API_KEY;
+      // Apps Script web app: "daywise-waitlist", deployed from the waitlist Sheet.
+      // Not a secret — it ships in this page's source for every visitor, which is why
+      // the .gs validates what it accepts. Access is "Anyone" (required: visitors are
+      // anonymous and send no Google credentials).
+      var WAITLIST_ENDPOINT =
+        'https://script.google.com/macros/s/AKfycbxMgrRg7K9XpEZDbqtJyD_G2XqOKTF37eOabyrmf_TNPZGW7MC4m_SSimIU2kj_qv6iOg/exec';
 
       document.getElementById('year').textContent = new Date().getFullYear();
 
@@ -405,34 +423,71 @@
         button.textContent = 'Adding…';
 
         // Honeypot tripped — almost certainly a bot. Show the same success state so
-        // it gets no signal, but write nothing.
+        // it gets no signal, but record nothing.
         if (honeypot && honeypot.value) {
           finish();
           return;
         }
 
-        fetch(WAITLIST_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            fields: {
-              email: { stringValue: email },
-              source: { stringValue: 'coming-soon' },
-              createdAt: { timestampValue: new Date().toISOString() },
+        // No endpoint configured. This MUST surface an error: an earlier version
+        // short-circuited to the success screen here, so every signup was discarded
+        // while the visitor was told they were on the list.
+        if (!WAITLIST_ENDPOINT) {
+          showError('Sign-ups aren’t quite ready — please try again shortly.');
+          return;
+        }
+
+        // No timestamp is sent: the Apps Script stamps its own server-side, so a wrong
+        // or falsified device clock can't affect the record.
+        var payload = JSON.stringify({
+          email: email,
+          source: 'coming-soon',
+          userAgent: navigator.userAgent,
+        });
+
+        var post = function (blind) {
+          return fetch(WAITLIST_ENDPOINT, {
+            method: 'POST',
+            // text/plain keeps this a CORS-safelisted header, so no preflight is
+            // needed in either mode.
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: payload,
+            mode: blind ? 'no-cors' : 'cors',
+          });
+        };
+
+        post(false)
+          .then(
+            function (res) {
+              // Readable response — this is the final answer, whatever it says.
+              if (!res.ok) return false;
+              return res.text().then(function (text) {
+                try {
+                  var data = JSON.parse(text);
+                  // A duplicate is still a success from the visitor's point of view —
+                  // they are on the list, just already.
+                  return !!(data && data.ok);
+                } catch (err) {
+                  // Readable but not JSON: an Apps Script error page, or a URL that
+                  // isn't the /exec deployment. Report it — don't paper over it.
+                  return false;
+                }
+              });
             },
-          }),
-        })
-          .then(function (res) {
-            if (res.ok) {
-              finish();
-              return;
-            }
-            // 400/403 here means the rules rejected the write or the config is wrong.
-            // Never show success in that case — the whole point is not to tell someone
-            // they're on a list they aren't on.
-            showError('Sorry, we couldn’t add you just then — please try again.');
+            function () {
+              // Nothing to inspect: the read was CORS-blocked, or we're offline.
+              // Re-send blind; an opaque response means delivered, not confirmed.
+              return post(true).then(function () {
+                return true;
+              });
+            },
+          )
+          .then(function (ok) {
+            if (ok) finish();
+            else showError('Sorry, we couldn’t add you just then — please try again.');
           })
           .catch(function () {
+            // Both attempts failed to leave the device.
             showError('Something went wrong — please check your connection and try again.');
           });
       });
